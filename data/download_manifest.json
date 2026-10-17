@@ -1,0 +1,51 @@
+[
+  {
+    "dataset": "parkinsons",
+    "url": "https://archive.ics.uci.edu/static/public/174/parkinsons.zip",
+    "file": "parkinsons/parkinsons.zip",
+    "bytes": 304171,
+    "sha256": "9baccfbcdac15d6d9347b37c2a352fb31d65c52e367df5a47d7543a55c75b0ab"
+  },
+  {
+    "dataset": "musk",
+    "url": "https://archive.ics.uci.edu/static/public/74/musk%2Bversion%2B1.zip",
+    "file": "musk/musk_version_1.zip",
+    "bytes": 115543,
+    "sha256": "84fd967a312cfe1d48d6f5a2becdda68f122767c0d51a3246cf699ff92a66031"
+  },
+  {
+    "dataset": "spect",
+    "url": "https://archive.ics.uci.edu/static/public/95/spect%2Bheart.zip",
+    "file": "spect/spect_heart.zip",
+    "bytes": 3669,
+    "sha256": "0df4ab4903ce89626df28e9f8436d84399a68bc45d6d16a4c1f0dd53028449fa"
+  },
+  {
+    "dataset": "promoter",
+    "url": "https://archive.ics.uci.edu/static/public/67/molecular%2Bbiology%2Bpromoter%2Bgene%2Bsequences.zip",
+    "file": "promoter/promoter_gene_sequences.zip",
+    "bytes": 5237,
+    "sha256": "56d462fe7e27dfece24dd5033e2c359c604b5675f5ba448eb0a9ceb7284b4eb2"
+  },
+  {
+    "dataset": "lymphography",
+    "url": "https://archive.ics.uci.edu/static/public/63/lymphography.zip",
+    "file": "lymphography/lymphography.zip",
+    "bytes": 2980,
+    "sha256": "082ff211040ad7dc2122e92441aa3eee494ab6496fecdcd86a440fe863ee5b6f"
+  },
+  {
+    "dataset": "isoprenoid",
+    "url": "https://media.springernature.com/original/springer-static/esm/art%3A10.1186%2Fgb-2004-5-11-r92/MediaObjects/13059_2004_896_MOESM1_ESM.txt",
+    "file": "isoprenoid/isoprenoid_original.txt",
+    "bytes": 32530,
+    "sha256": "d4ce7f64c1884e9f13af24b0929fca1d0ecbf602e5c4c3b161e08e9ac021e540"
+  },
+  {
+    "dataset": "insulin",
+    "url": "https://ftp.ncbi.nlm.nih.gov/geo/datasets/GDS3nnn/GDS3715/soft/GDS3715.soft.gz",
+    "file": "insulin/GDS3715.soft.gz",
+    "bytes": 4611666,
+    "sha256": "48bcd37c4101d90508b7394e4ccb2e3ce86314db7a4c81a65a4aa337c7d5d88c"
+  }
+]

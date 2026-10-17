@@ -1,0 +1,563 @@
+---
+title: "MissForest Implementation"
+author: "Aran Lyons"
+output: html_document
+---
+  
+```{r setup, echo = FALSE}
+library(missForest)
+library(mice)
+library(impute)
+library(GEOquery)
+library(tidyverse)
+```
+
+```{r, import data}
+#Import the Datasets
+Parkinsons <- read.csv("data/parkinsons/raw/parkinsons.data", header = TRUE)
+Lymphography <- read.csv("data/lymphography/raw/lymphography.data", header = FALSE)
+Musk <- read.csv("data/musk/raw/clean1.data", header = FALSE)
+Promoter <- read.csv("data/promoter/raw/promoters.data",
+                     header = FALSE,
+                     strip.white = TRUE,
+                     stringsAsFactors = FALSE)
+
+Spect_train <- read.csv("data/spect/raw/SPECT.train", header = FALSE)           # Spect is split into train and test data sets so we combine them again
+Spect_test <- read.csv("data/spect/raw/SPECT.test", header = FALSE)
+Spect <- rbind(Spect_train, Spect_test)
+
+Isoprenoid_raw <- read.table(
+  file = "data/isoprenoid/isoprenoid_original.txt",
+  header = TRUE,
+  skip = 6,
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  quote = "",
+  comment.char = ""
+  )
+```
+
+```{r, continuous data}
+#Preparing the continuous datasets by dropping character columns
+Isoprenoid_cont <- data.frame(t(Isoprenoid_raw[, -c(1:6)]))
+Parkinsons_cont <- Parkinsons[, -c(1, 18)]
+Musk_cont <- Musk[, -c(1,2,ncol(Musk)), drop = FALSE]
+
+continuous <- list(Isoprenoid = Isoprenoid_cont,
+                   Parkinsons = Parkinsons_cont,
+                   Musk = Musk_cont)
+```
+
+```{r, categorical data}
+#Preparing the categorical datasets by dummy encoding for KNNimpute
+Spect_cat <- Spect[, -1] %>%
+  mutate(across(everything(), factor))
+
+Promoter_cat <- Promoter[, c(1,3)] %>%
+  separate_wider_position(col = V3,
+                          widths = setNames(rep(1, 57), paste0("base_", 1:57)))%>%
+  mutate(across(everything(), factor))
+
+Lymphography_cat <- Lymphography %>%
+  mutate(across(everything(), factor))
+
+categorical <- list(Spect = Spect_cat,
+                    Promoter = Promoter_cat,
+                    Lymphography = Lymphography_cat)
+```
+
+```{r, error functions}
+#Define the functions for NRMSE and PFC
+NRMSE <- function(true_df, imp_df, na_df){
+  missing_mask <- is.na(na_df)
+  true <- as.matrix(true_df)[missing_mask]
+  imp <- as.matrix(imp_df)[missing_mask]
+  
+  sqrt( mean((true - imp)^2) / var(true) )
+}
+
+PFC <- function(true_df, imp_df, na_df){
+  missing_mask <- is.na(na_df)
+  true <- as.matrix(true_df)[missing_mask]
+  imp <- as.matrix(imp_df)[missing_mask]
+  
+  nfc <- sum(true != imp)
+  nfc/length(true)
+}
+```
+
+```{r, missing function}
+#Define a function to generate missingness in the data
+missing_gen <- function(df, percentage, seed = 123){
+  set.seed(seed)
+  
+  n_cells <- prod(dim(df))
+  n_remove <- round(n_cells * (percentage / 100))
+  chosen <- sample.int(n_cells, size = n_remove)
+  
+  missing_mask <- matrix(FALSE,
+                         nrow = nrow(df), 
+                         ncol = ncol(df))
+  missing_mask[chosen] <- TRUE
+  
+  df[missing_mask] <- NA
+  df
+}
+```
+
+```{r, KNNimpute}
+knn_impute_df <- function(df, k) {
+  # Standardise columns using their observed values
+  x <- as.matrix(df)
+  centres <- colMeans(x, na.rm = TRUE)
+  if (any(!is.finite(centres))) {
+    stop("KNN imputation requires at least one observed value per column.")
+  }
+  scales <- apply(x, 2, sd, na.rm = TRUE)
+  # Constant columns (or columns with one observation) cannot be scaled by SD.
+  constant <- !is.finite(scales) | scales == 0
+  scales[constant] <- 1
+  x <- sweep(sweep(x, 2, centres, "-"), 2, scales, "/")
+  # For these columns the only observed value is the best available estimate.
+  x[, constant] <- 0
+  
+  # impute.knn expects variables in rows, so transpose
+  result <- impute::impute.knn(
+    t(x),
+    k = k,
+    maxp = ncol(df)
+  )$data
+  
+  # Restore observations as rows and original scales
+  result <- sweep(t(result), 2, scales, "*")
+  result <- sweep(result, 2, centres, "+")
+  
+  as.data.frame(result)
+}
+
+knn_impute_cat <- function(df, k = 5) {
+  df <- as.data.frame(df)
+
+  # Full one-hot encoding; missing categories produce all-NA blocks.
+  blocks <- lapply(df, function(x) {
+    vapply(
+      levels(x),
+      function(level) as.numeric(x == level),
+      numeric(nrow(df))
+    )
+  })
+
+  dummy <- do.call(cbind, blocks)
+
+  # Rows with no information cannot have meaningful nearest neighbours.
+  # Use observed dummy frequencies for these rows.
+  empty_rows <- rowSums(!is.na(dummy)) == 0
+  frequencies <- colMeans(dummy, na.rm = TRUE)
+
+  if (any(empty_rows)) {
+    dummy[empty_rows, ] <- matrix(
+      frequencies,
+      nrow = sum(empty_rows),
+      ncol = ncol(dummy),
+      byrow = TRUE
+    )
+  }
+
+  # Find neighbouring observations using their dummy-encoded features.
+  # Keep 0/1 columns unscaled.
+  imputed <- impute::impute.knn(
+    dummy,
+    k = k,
+    rowmax = 1,
+    colmax = 1,
+    maxp = nrow(dummy)
+  )$data
+
+  result <- df
+  offset <- 0L
+
+  for (j in seq_along(df)) {
+    columns <- offset + seq_len(ncol(blocks[[j]]))
+    missing <- is.na(df[[j]])
+
+    if (any(missing)) {
+      scores <- imputed[missing, columns, drop = FALSE]
+
+      # Resolve ties consistently using the factor-level order.
+      selected <- max.col(scores, ties.method = "first")
+      result[[j]][missing] <- levels(df[[j]])[selected]
+    }
+
+    offset <- offset + ncol(blocks[[j]])
+  }
+
+  result
+}
+```
+
+```{r, mice}
+mice_impute_df <- function(na_df, m = 5, maxit = 5, seed = 123) {
+
+  methods <- mice::make.method(
+    na_df,
+    defaultMethod = c("norm", "logreg", "polyreg", "polyreg")
+  )
+
+  fit <- mice::mice(
+    na_df,
+    method = methods,
+    m = m,
+    maxit = maxit,
+    seed = seed,
+    printFlag = FALSE
+  )
+
+  mice::complete(fit, action = "all")
+}
+```
+
+
+```{r, Imputation function for continuous data}
+calc_cont <- function(df, p, K = 1:15, folds = 5, seed = 123) {
+  na_df <- missing_gen(df, p, seed = seed)
+  
+  # Initial mean imputation for the validation reference
+  cv_reference <- na_df
+  
+  for (j in seq_len(ncol(cv_reference))) {
+    missing <- is.na(cv_reference[[j]])
+    cv_reference[[j]][missing] <- mean(
+      cv_reference[[j]],
+      na.rm = TRUE
+    )
+  }
+  
+  # Record validation error for each k and repetition
+  cv_errors <- matrix(
+    NA_real_,
+    nrow = folds,
+    ncol = length(K)
+  )
+  
+  for (i in seq_len(folds)) {
+    cv_na <- missing_gen(cv_reference, p, seed = seed + i)
+    
+    for (j in seq_along(K)) {
+      cv_imp <- knn_impute_df(cv_na, k = K[j])
+      
+      cv_errors[i, j] <- NRMSE(cv_reference, cv_imp, cv_na)
+    }
+  }
+  
+  mean_errors <- colMeans(cv_errors)
+  best_k <- K[which.min(mean_errors)]
+  
+  # Apply both methods to the same incomplete dataset
+  # KNN cross-validation resets the RNG; give missForest its own seed.
+  set.seed(seed)
+  mf_imp <- missForest::missForest(na_df)$ximp
+  knn_imp <- knn_impute_df(na_df, k = best_k)
+  
+  list(
+    best_k = best_k,
+    cv_results = data.frame(k = K, NRMSE = mean_errors),
+    missForest_NRMSE = NRMSE(df, mf_imp, na_df),
+    KNN_NRMSE = NRMSE(df, knn_imp, na_df),
+    missForest_imputed = mf_imp,
+    KNN_imputed = knn_imp
+  )
+}
+```
+
+```{r, Continuous data results}
+cont_results <- tibble(dataset = character(),
+                       missingness = character(),
+                       method = character(),
+                       NRMSE = numeric())
+
+
+for (name in names(continuous)){
+  for (p in c(10,20,30)){
+  df <- continuous[[name]]
+  results <- calc_cont(df, p)
+  cont_results <- cont_results%>%
+    add_row(dataset = name,
+            missingness = paste0(p, "%"),
+            method = "MissForest",
+            NRMSE = results$missForest_NRMSE)%>%
+    
+    add_row(dataset = name,
+            missingness = paste0(p, "%"),
+            method = "KNNimpute",
+            NRMSE = results$KNN_NRMSE)
+  }
+}
+```
+
+```{r, Imputation function for categorical data}
+calc_cat <- function(df, p, seed = 123,
+                     mice_m = 5, mice_maxit = 5, run_mice = TRUE) {
+  df <- as.data.frame(df)
+  na_df <- missing_gen(df, p, seed = seed)
+
+  # Apply the selected methods to the same incomplete dataset.
+  set.seed(seed)
+  message("Running missForest")
+  mf_imp <- missForest::missForest(na_df)$ximp
+  mice_imp <- NULL
+  if (run_mice) {
+    message("Running mice")
+    mice_imp <- mice_impute_df(
+      na_df, m = mice_m, maxit = mice_maxit, seed = seed
+    )
+  } else {
+    message("Skipping mice")
+  }
+  message("Running KNN")
+  knn_imp <- knn_impute_cat(na_df, k = 5)
+  
+  mice_PFC <- vapply(mice_imp, function(df_imp) {
+    PFC(df, df_imp, na_df)
+  }, numeric(1))
+  
+  list(
+    missForest_PFC = PFC(df, mf_imp, na_df),
+    KNN_PFC = PFC(df, knn_imp, na_df),
+    # Zero is a placeholder for skipped MICE runs, not a measured error.
+    MICE_PFC = if (run_mice) mean(mice_PFC) else 0,
+    missForest_imputed = mf_imp,
+    KNN_imputed = knn_imp,
+    MICE_imputed = mice_imp
+  )
+}
+```
+
+```{r categorical-results}
+cat_results <- tibble(dataset = character(),
+                      missingness = character(),
+                      method = character(),
+                      PFC = numeric())
+
+missingness_levels <- c(10, 20, 30)
+n_runs <- length(categorical) * length(missingness_levels)
+run <- 0L
+
+for (name in names(categorical)) {
+  for (p in missingness_levels) {
+    run <- run + 1L
+    message(sprintf("Run %d/%d: %s, %d%% missingness", run, n_runs, name, p))
+    run_mice <- name != "Promoter"
+    results <- calc_cat(categorical[[name]], p, run_mice = run_mice)
+
+    cat_results <- bind_rows(cat_results, tibble(
+      dataset = name,
+      missingness = paste0(p, "%"),
+      method = c("MissForest", "KNNimpute", "mice"),
+      PFC = c(results$missForest_PFC, results$KNN_PFC, results$MICE_PFC)
+    ))
+    message(sprintf("Completed run %d/%d", run, n_runs))
+  }
+}
+```
+
+```{r mixed-data}
+Musk_mixed <- Musk[, -c(1, 2), drop = FALSE]
+names(Musk_mixed) <- c(paste0("feature_", 1:166), "class")
+Musk_mixed$class <- factor(Musk_mixed$class)
+```
+
+```{r KNNimpute-mixed}
+knn_impute_mixed <- function(df, k = 5) {
+  df <- as.data.frame(df)
+  numerical <- vapply(df, is.numeric, logical(1))
+  categorical <- vapply(df, is.factor, logical(1))
+  stopifnot(all(numerical | categorical), any(numerical), any(categorical),
+            k >= 1, k < nrow(df))
+  if (any(vapply(df, function(x) all(is.na(x)), logical(1)))) {
+    stop("KNN imputation requires an observed value in every column.")
+  }
+
+  # Combine standardised numerical features with unscaled one-hot categories.
+  # Both types contribute to finding neighbouring observations.
+  x <- as.matrix(df[, numerical, drop = FALSE])
+  centres <- colMeans(x, na.rm = TRUE)
+  scales <- apply(x, 2, sd, na.rm = TRUE)
+  constant <- !is.finite(scales) | scales == 0
+  scales[constant] <- 1
+  x <- sweep(sweep(x, 2, centres, "-"), 2, scales, "/")
+  x[, constant] <- 0
+
+  blocks <- lapply(df[, categorical, drop = FALSE], function(x) {
+    vapply(levels(x), function(level) as.numeric(x == level),
+           numeric(nrow(df)))
+  })
+  encoded <- cbind(x, do.call(cbind, blocks))
+
+  # As in categorical KNN, use observed means for entirely empty rows.
+  empty_rows <- rowSums(!is.na(encoded)) == 0
+  if (any(empty_rows)) {
+    encoded[empty_rows, ] <- matrix(
+      colMeans(encoded, na.rm = TRUE), nrow = sum(empty_rows),
+      ncol = ncol(encoded), byrow = TRUE
+    )
+  }
+
+  imputed <- impute::impute.knn(
+    encoded, k = k, rowmax = 1, colmax = 1, maxp = nrow(encoded)
+  )$data
+
+  # Restore original units and factor levels, replacing only missing cells.
+  result <- df
+  numeric_columns <- which(numerical)
+  restored <- sweep(imputed[, seq_along(numeric_columns), drop = FALSE],
+                    2, scales, "*")
+  restored <- sweep(restored, 2, centres, "+")
+  for (j in seq_along(numeric_columns)) {
+    column <- numeric_columns[j]
+    missing <- is.na(df[[column]])
+    result[[column]][missing] <- restored[missing, j]
+  }
+
+  offset <- length(numeric_columns)
+  categorical_columns <- which(categorical)
+  for (j in seq_along(categorical_columns)) {
+    column <- categorical_columns[j]
+    columns <- offset + seq_len(ncol(blocks[[j]]))
+    missing <- is.na(df[[column]])
+    if (any(missing)) {
+      scores <- imputed[missing, columns, drop = FALSE]
+      selected <- max.col(scores, ties.method = "first")
+      result[[column]][missing] <- levels(df[[column]])[selected]
+    }
+    offset <- offset + ncol(blocks[[j]])
+  }
+  result
+}
+```
+
+```{r imputation-mixed}
+calc_mixed <- function(df, p, k = 5, seed = 123,
+                       mice_m = 5, mice_maxit = 5) {
+  df <- as.data.frame(df)
+  numerical <- vapply(df, is.numeric, logical(1))
+  categorical <- vapply(df, is.factor, logical(1))
+  stopifnot(all(numerical | categorical), any(numerical), any(categorical))
+  na_df <- missing_gen(df, p, seed = seed)
+
+  # Fit each method jointly to the numerical features and categorical class.
+  set.seed(seed)
+  message("Running missForest (mixed Musk)")
+  mf_imp <- missForest::missForest(na_df)$ximp
+  message("Running mice (mixed Musk)")
+  mice_imp <- mice_impute_df(
+    na_df, m = mice_m, maxit = mice_maxit, seed = seed
+  )
+  message("Running KNN (mixed Musk)")
+  knn_imp <- knn_impute_mixed(na_df, k = k)
+
+  # Reuse the error functions on their appropriate column types only.
+  score <- function(imputed) {
+    c(NRMSE = NRMSE(df[, numerical, drop = FALSE],
+                    imputed[, numerical, drop = FALSE],
+                    na_df[, numerical, drop = FALSE]),
+      PFC = PFC(df[, categorical, drop = FALSE],
+                imputed[, categorical, drop = FALSE],
+                na_df[, categorical, drop = FALSE]))
+  }
+  mf_error <- score(mf_imp)
+  knn_error <- score(knn_imp)
+  # Average errors across MICE's completed datasets, as in calc_cat().
+  mice_error <- rowMeans(vapply(mice_imp, score, numeric(2)))
+
+  list(
+    scores = tibble(
+      method = c("MissForest", "KNNimpute", "mice"),
+      NRMSE = c(mf_error["NRMSE"], knn_error["NRMSE"], mice_error["NRMSE"]),
+      PFC = c(mf_error["PFC"], knn_error["PFC"], mice_error["PFC"])
+    ),
+    missForest_imputed = mf_imp,
+    KNN_imputed = knn_imp,
+    MICE_imputed = mice_imp
+  )
+}
+```
+
+```{r mixed-results}
+mixed_results <- tibble(dataset = character(), missingness = character(),
+                        method = character(), NRMSE = numeric(), PFC = numeric())
+mixed_missingness_levels <- c(10, 20, 30)
+
+for (i in seq_along(mixed_missingness_levels)) {
+  p <- mixed_missingness_levels[i]
+  message(sprintf("Mixed Musk run %d/%d: %d%% missingness",
+                  i, length(mixed_missingness_levels), p))
+  results <- calc_mixed(Musk_mixed, p, mice_m = 1, mice_maxit = 1)
+  mixed_results <- bind_rows(mixed_results,
+    results$scores %>%
+      mutate(dataset = "Musk", missingness = paste0(p, "%"), .before = 1)
+  )
+  message(sprintf("Completed mixed Musk run %d/%d",
+                  i, length(mixed_missingness_levels)))
+}
+```
+
+```{r, plot}
+categorical_plot <- ggplot(cat_results, aes(x = missingness, y = PFC, fill = method)) +
+  geom_col(position = position_dodge(width = 0.55), width = 0.5) +
+  facet_grid(dataset ~ ., switch = "y") +
+  labs(x = "Missingness", y = "PFC", fill = "Method", title = "Categorical Data") +
+  theme_minimal() +
+  theme(
+  strip.placement = "outside",
+  strip.text.y.left = element_text(angle = 0),
+  strip.background = element_blank(),
+  panel.spacing.y = grid::unit(0.25, "cm"),
+  panel.border = element_rect(colour = "grey75", fill = NA))+
+  scale_fill_grey()
+```
+
+```{r, plotting continuous data results}
+continuous_plot <- ggplot(cont_results, aes(x = missingness, y = NRMSE, fill = method)) +
+  geom_col(position = position_dodge(width = 0.55), width = 0.5) +
+  facet_grid(dataset ~ ., switch = "y") +
+  labs(x = "Missingness", y = "NRMSE", fill = "Method", title = "Continuous Data") +
+  theme_minimal() +
+  theme(
+  strip.placement = "outside",
+  strip.text.y.left = element_text(angle = 0),
+  strip.background = element_blank(),
+  panel.spacing.y = grid::unit(0.25, "cm"),
+  panel.border = element_rect(colour = "grey75", fill = NA))+
+  scale_fill_grey()
+```
+
+```{r plotting-mixed-results, fig.height = 6}
+mixed_plot_data <- mixed_results %>%
+  pivot_longer(cols = c(NRMSE, PFC), names_to = "metric", values_to = "error")
+
+mixed_plot <- ggplot(mixed_plot_data, aes(x = missingness, y = error, fill = method)) +
+  geom_col(position = position_dodge(width = 0.55), width = 0.5) +
+  facet_grid(metric ~ ., scales = "free_y", switch = "y") +
+  labs(x = "Missingness", y = "Error", fill = "Method", title = "Mixed Data: Musk") +
+  theme_minimal() +
+  theme(
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 0),
+    strip.background = element_blank(),
+    panel.spacing.y = grid::unit(0.25, "cm"),
+    panel.border = element_rect(colour = "grey75", fill = NA)) +
+  scale_fill_grey()
+```
+
+
+```{r save-plots-png}
+# Word-ready PNGs: 6.2 inches wide for A4 pages with standard margins.
+dir.create("plots", showWarnings = FALSE)
+
+ggsave("plots/continuous_results.png", plot = continuous_plot,
+       width = 6.2, height = 3, units = "in", dpi = 300, bg = "white")
+ggsave("plots/categorical_results.png", plot = categorical_plot,
+       width = 6.2, height = 3, units = "in", dpi = 300, bg = "white")
+ggsave("plots/musk_mixed_results.png", plot = mixed_plot,
+       width = 6.2, height = 3, units = "in", dpi = 300, bg = "white")
+```
